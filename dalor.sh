@@ -1,93 +1,151 @@
 #!/bin/bash
 
-# DaloRADIUS installation script for Ubuntu 22.04
-# Run this script as root or with sudo privileges
-
-# Set passwords
-MYSQL_ROOT_PASS="MySQLRoot@2024"
-RADIUS_DB_PASS="RadiusDB@2024"
-DALORADIUS_ADMIN_PASS="AdminPass@2024"
-
 # Exit on error
 set -e
 
+# Configuration variables
+MYSQL_ROOT_PASSWORD=$(openssl rand -hex 8)
+RADIUS_DB_PASSWORD=$(openssl rand -hex 8)
+DALORADIUS_VERSION="1.2"
+SERVER_IP=$(hostname -I | cut -d' ' -f1)
+
+# Function to log messages
+log() {
+    echo "[$(date +'%Y-%m-%d %H:%M:%S')] $1"
+}
+
+# Save credentials to a file
+save_credentials() {
+    cat > /root/radius_credentials.txt <<EOF
+FreeRADIUS Installation Credentials
+==================================
+Date: $(date)
+Server IP: $SERVER_IP
+
+Database Credentials:
+-------------------
+MySQL Root Password: $MYSQL_ROOT_PASSWORD
+Radius DB User: radius
+Radius DB Password: $RADIUS_DB_PASSWORD
+
+DaloRADIUS Web Interface:
+-----------------------
+URL: http://$SERVER_IP/daloradius
+Username: administrator
+Password: radius
+
+Please store this information securely!
+EOF
+    chmod 600 /root/radius_credentials.txt
+}
+
+# Check if running as root
+if [ "$EUID" -ne 0 ]; then
+    log "Please run as root"
+    exit 1
+fi
+
 # Update system
-echo "Updating system..."
-apt update && apt upgrade -y
+log "Updating system packages..."
+apt-get update
+apt-get upgrade -y
 
 # Install required packages
-echo "Installing required packages..."
-apt install -y apache2 mariadb-server php php-mysql php-gd php-common \
-    php-mail php-mail-mime php-curl php-cli php-zip php-ldap php-mbstring \
-    php-xml freeradius freeradius-mysql freeradius-utils git unzip
+log "Installing required packages..."
+apt-get install -y mariadb-server freeradius freeradius-mysql apache2 php php-mysql \
+    php-gd php-common php-mail php-mail-mime php-mysql php-pear php-db php-mbstring php-xml \
+    unzip wget
 
-# Secure MariaDB installation
-echo "Configuring MariaDB..."
-mysql -e "SET PASSWORD FOR root@localhost = PASSWORD('${MYSQL_ROOT_PASS}');"
-mysql -e "DELETE FROM mysql.user WHERE User='';"
-mysql -e "DELETE FROM mysql.user WHERE User='root' AND Host NOT IN ('localhost', '127.0.0.1', '::1');"
-mysql -e "DROP DATABASE IF EXISTS test;"
-mysql -e "DELETE FROM mysql.db WHERE Db='test' OR Db='test\\_%';"
-mysql -e "FLUSH PRIVILEGES;"
+# Configure MariaDB
+log "Configuring MariaDB..."
+mysql -u root <<EOF
+ALTER USER 'root'@'localhost' IDENTIFIED BY '$MYSQL_ROOT_PASSWORD';
+CREATE DATABASE IF NOT EXISTS radius;
+GRANT ALL ON radius.* TO 'radius'@'localhost' IDENTIFIED BY '$RADIUS_DB_PASSWORD';
+FLUSH PRIVILEGES;
+EOF
 
-# Create radius database and user
-echo "Creating radius database..."
-mysql -u root -p${MYSQL_ROOT_PASS} -e "CREATE DATABASE radius;"
-mysql -u root -p${MYSQL_ROOT_PASS} -e "GRANT ALL ON radius.* TO 'radius'@'localhost' IDENTIFIED BY '${RADIUS_DB_PASS}';"
-mysql -u root -p${MYSQL_ROOT_PASS} -e "FLUSH PRIVILEGES;"
-
-# Import radius schema
-echo "Importing radius schema..."
-mysql -u root -p${MYSQL_ROOT_PASS} radius < /etc/freeradius/3.0/mods-config/sql/main/mysql/schema.sql
+# Import schema
+log "Importing radius schema..."
+mysql -u root -p$MYSQL_ROOT_PASSWORD radius < /etc/freeradius/3.0/mods-config/sql/main/mysql/schema.sql
 
 # Configure FreeRADIUS
-echo "Configuring FreeRADIUS..."
-cd /etc/freeradius/3.0/mods-enabled/
-ln -s ../mods-available/sql sql
-cd ../sites-enabled/
-ln -s ../sites-available/default default
+log "Configuring FreeRADIUS..."
+# Backup original sql module configuration
+cp /etc/freeradius/3.0/mods-available/sql /etc/freeradius/3.0/mods-available/sql.orig
 
-# Update sql module configuration
-sed -i 's/dialect = "sqlite"/dialect = "mysql"/' /etc/freeradius/3.0/mods-enabled/sql
-sed -i 's/#\s*server = "localhost"/server = "localhost"/' /etc/freeradius/3.0/mods-enabled/sql
-sed -i 's/#\s*port = 3306/port = 3306/' /etc/freeradius/3.0/mods-enabled/sql
-sed -i 's/#\s*login = "radius"/login = "radius"/' /etc/freeradius/3.0/mods-enabled/sql
-sed -i 's/#\s*password = "radpass"/password = "'${RADIUS_DB_PASS}'"/' /etc/freeradius/3.0/mods-enabled/sql
+# Configure sql module
+cat > /etc/freeradius/3.0/mods-available/sql <<EOF
+sql {
+    driver = "rlm_sql_mysql"
+    dialect = "mysql"
+    server = "localhost"
+    port = 3306
+    login = "radius"
+    password = "$RADIUS_DB_PASSWORD"
+    radius_db = "radius"
+    
+    read_groups = yes
+    read_profiles = yes
+    
+    encryption_scheme = clear
+}
+EOF
+
+# Remove existing symbolic links if they exist
+log "Cleaning up existing symbolic links..."
+rm -f /etc/freeradius/3.0/mods-enabled/sql
+rm -f /etc/freeradius/3.0/sites-enabled/default
+
+# Create new symbolic links
+log "Creating new symbolic links..."
+ln -s /etc/freeradius/3.0/mods-available/sql /etc/freeradius/3.0/mods-enabled/
+ln -s /etc/freeradius/3.0/sites-available/default /etc/freeradius/3.0/sites-enabled/
 
 # Install daloRADIUS
-echo "Installing daloRADIUS..."
-cd /var/www/html
-wget https://github.com/lirantal/daloradius/archive/master.zip
-unzip master.zip
-mv daloradius-master daloradius
-rm master.zip
-cd daloradius
-mysql -u root -p${MYSQL_ROOT_PASS} radius < contrib/db/fr2-mysql-daloradius-and-freeradius.sql
-mysql -u root -p${MYSQL_ROOT_PASS} radius < contrib/db/mysql-daloradius.sql
+log "Installing daloRADIUS..."
+cd /tmp
+wget https://github.com/lirantal/daloradius/archive/refs/tags/$DALORADIUS_VERSION.zip
+unzip $DALORADIUS_VERSION.zip
+mv daloradius-$DALORADIUS_VERSION /var/www/html/daloradius
+cd /var/www/html/daloradius
+mysql -u root -p$MYSQL_ROOT_PASSWORD radius < contrib/db/fr2-mysql-daloradius-and-freeradius.sql
+mysql -u root -p$MYSQL_ROOT_PASSWORD radius < contrib/db/mysql-daloradius.sql
 
 # Configure daloRADIUS
-cp contrib/configs/daloradius.conf.php library/
-sed -i "s/\$configValues\['CONFIG_DB_PASS'\] = '';/\$configValues\['CONFIG_DB_PASS'\] = '${RADIUS_DB_PASS}';/" library/daloradius.conf.php
+cp /var/www/html/daloradius/library/daloradius.conf.php.sample /var/www/html/daloradius/library/daloradius.conf.php
+sed -i "s/\$configValues\['CONFIG_DB_PASS'\] = '';/\$configValues\['CONFIG_DB_PASS'\] = '$RADIUS_DB_PASSWORD';/" /var/www/html/daloradius/library/daloradius.conf.php
 
-# Set daloRADIUS admin password
-DALORADIUS_ADMIN_PASS_MD5=$(echo -n "${DALORADIUS_ADMIN_PASS}" | md5sum | cut -d ' ' -f 1)
-mysql -u root -p${MYSQL_ROOT_PASS} radius -e "UPDATE operators SET password='${DALORADIUS_ADMIN_PASS_MD5}' WHERE username='administrator';"
-
-# Set permissions
-chown -R www-data:www-data /var/www/html/daloradius
+# Set proper permissions
+log "Setting correct permissions..."
+chown -R freerad:freerad /etc/freeradius/3.0/mods-enabled/sql
+chmod 640 /etc/freeradius/3.0/mods-enabled/sql
+chown -R www-data:www-data /var/www/html/daloradius/
 chmod 644 /var/www/html/daloradius/library/daloradius.conf.php
 
-# Restart services
-systemctl restart mariadb
-systemctl restart freeradius
+# Start and enable services
+log "Starting services..."
 systemctl restart apache2
+systemctl restart freeradius
+systemctl enable freeradius
+systemctl enable apache2
 
-echo "Installation completed!"
-echo "-----------------------------------"
-echo "MySQL root password: ${MYSQL_ROOT_PASS}"
-echo "RADIUS DB password: ${RADIUS_DB_PASS}"
-echo "DaloRADIUS admin credentials:"
+# Save credentials
+save_credentials
+
+# Display installation summary
+log "Installation complete! Here's your installation summary:"
+echo "============================================"
+echo "FreeRADIUS and daloRADIUS have been installed!"
+echo "============================================"
+echo "DaloRADIUS Web Interface:"
+echo "URL: http://$SERVER_IP/daloradius"
 echo "Username: administrator"
-echo "Password: ${DALORADIUS_ADMIN_PASS}"
-echo "-----------------------------------"
-echo "Access daloRADIUS at: http://your-server-ip/daloradius"
+echo "Password: radius"
+echo ""
+echo "All credentials have been saved to: /root/radius_credentials.txt"
+echo "Please make sure to secure this file!"
+echo "============================================"
+echo "To test FreeRADIUS, you can use the radtest command:"
+echo "radtest user password localhost 0 testing123"
+echo "============================================"
