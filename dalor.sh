@@ -55,14 +55,28 @@ apt-get upgrade -y
 log "Installing required packages..."
 apt-get install -y mariadb-server freeradius freeradius-mysql apache2 \
     php php-mysql php-gd php-common php-mail php-mail-mime php-mysql \
-    php-pear php-db php-mbstring php-xml php-zip php-curl \
+    php-pear php-db php-mbstring php-xml php-zip php-curl libapache2-mod-php \
     unzip wget git
+
+# Enable Apache modules
+log "Enabling Apache modules..."
+a2enmod php
+a2enmod rewrite
 
 # Configure PHP
 log "Configuring PHP..."
-cat > /etc/php/*/apache2/php.ini <<EOF
+PHP_VERSION=$(php -r "echo PHP_MAJOR_VERSION.'.'.PHP_MINOR_VERSION;")
+cat > /etc/php/$PHP_VERSION/apache2/php.ini <<EOF
+[PHP]
 display_errors = On
 error_reporting = E_ALL & ~E_NOTICE & ~E_DEPRECATED
+max_execution_time = 300
+memory_limit = 128M
+post_max_size = 32M
+upload_max_filesize = 32M
+date.timezone = UTC
+
+[Session]
 session.gc_maxlifetime = 14400
 session.gc_probability = 1
 session.gc_divisor = 1
@@ -117,63 +131,57 @@ log "Installing daloRADIUS..."
 cd /tmp
 wget https://github.com/lirantal/daloradius/archive/refs/tags/$DALORADIUS_VERSION.zip
 unzip $DALORADIUS_VERSION.zip
-mv daloradius-$DALORADIUS_VERSION /var/www/html/daloradius
-
-# Create required directories
-mkdir -p /var/www/html/daloradius/library/
-mkdir -p /var/www/html/daloradius/templates/
-
-# Configure daloRADIUS database
-cd /var/www/html/daloradius
-mysql -u root -p$MYSQL_ROOT_PASSWORD radius < contrib/db/fr2-mysql-daloradius-and-freeradius.sql
-mysql -u root -p$MYSQL_ROOT_PASSWORD radius < contrib/db/mysql-daloradius.sql
-
-# Configure daloRADIUS
-cp library/daloradius.conf.php.sample library/daloradius.conf.php
-sed -i "s/\$configValues\['CONFIG_DB_PASS'\] = '';/\$configValues\['CONFIG_DB_PASS'\] = '$RADIUS_DB_PASSWORD';/" library/daloradius.conf.php
-sed -i "s/\$configValues\['CONFIG_DB_USER'\] = 'root';/\$configValues\['CONFIG_DB_USER'\] = 'radius';/" library/daloradius.conf.php
+rm -rf /var/www/html/*
+mv daloradius-$DALORADIUS_VERSION/* /var/www/html/daloradius/
 
 # Configure Apache port
 log "Configuring Apache to listen on port $APACHE_PORT..."
 sed -i "s/Listen 80/Listen $APACHE_PORT/" /etc/apache2/ports.conf
-sed -i "s/<VirtualHost \*:80>/<VirtualHost *:$APACHE_PORT>/" /etc/apache2/sites-enabled/000-default.conf
 
 # Create Apache configuration for daloRADIUS
-cat > /etc/apache2/sites-available/daloradius.conf <<EOF
+cat > /etc/apache2/sites-available/000-default.conf <<EOF
 <VirtualHost *:$APACHE_PORT>
+    ServerAdmin webmaster@localhost
     DocumentRoot /var/www/html/daloradius
+    DirectoryIndex index.php
+    
     <Directory /var/www/html/daloradius>
-        Options -Indexes +FollowSymLinks
+        Options FollowSymLinks
         AllowOverride All
         Require all granted
         php_flag display_errors on
     </Directory>
-    ErrorLog \${APACHE_LOG_DIR}/daloradius-error.log
-    CustomLog \${APACHE_LOG_DIR}/daloradius-access.log combined
+
+    ErrorLog \${APACHE_LOG_DIR}/error.log
+    CustomLog \${APACHE_LOG_DIR}/access.log combined
 </VirtualHost>
 EOF
 
-# Enable the site
-a2ensite daloradius.conf
+# Configure daloRADIUS
+cd /var/www/html/daloradius
+mysql -u root -p$MYSQL_ROOT_PASSWORD radius < contrib/db/fr2-mysql-daloradius-and-freeradius.sql
+mysql -u root -p$MYSQL_ROOT_PASSWORD radius < contrib/db/mysql-daloradius.sql
+
+cp library/daloradius.conf.php.sample library/daloradius.conf.php
+sed -i "s/\$configValues\['CONFIG_DB_USER'\] = 'root';/\$configValues\['CONFIG_DB_USER'\] = 'radius';/" library/daloradius.conf.php
+sed -i "s/\$configValues\['CONFIG_DB_PASS'\] = '';/\$configValues\['CONFIG_DB_PASS'\] = '$RADIUS_DB_PASSWORD';/" library/daloradius.conf.php
 
 # Set proper permissions
 log "Setting correct permissions..."
-chown -R freerad:freerad /etc/freeradius/3.0/mods-enabled/sql
-chmod 640 /etc/freeradius/3.0/mods-enabled/sql
-chown -R www-data:www-data /var/www/html/daloradius/
-chmod 644 /var/www/html/daloradius/library/daloradius.conf.php
-
-# Create required directories with proper permissions
-mkdir -p /var/log/daloradius/
-touch /var/log/daloradius/daloradius.log
-chown -R www-data:www-data /var/log/daloradius/
-
-# Fix common daloRADIUS file permission issues
+chown -R www-data:www-data /var/www/html/daloradius
+chmod -R 755 /var/www/html/daloradius
 find /var/www/html/daloradius -type f -exec chmod 644 {} \;
 find /var/www/html/daloradius -type d -exec chmod 755 {} \;
 
-# Start and enable services
-log "Starting services..."
+# Create and set permissions for log directory
+mkdir -p /var/log/daloradius
+touch /var/log/daloradius/daloradius.log
+chown -R www-data:www-data /var/log/daloradius
+chmod 755 /var/log/daloradius
+chmod 644 /var/log/daloradius/daloradius.log
+
+# Restart services
+log "Restarting services..."
 systemctl restart apache2
 systemctl restart freeradius
 systemctl enable freeradius
@@ -193,12 +201,18 @@ echo "Username: administrator"
 echo "Password: radius"
 echo ""
 echo "All credentials have been saved to: /root/radius_credentials.txt"
-echo "Please make sure to secure this file!"
 echo "============================================"
-echo "To check Apache error logs:"
-echo "tail -f /var/log/apache2/daloradius-error.log"
+echo "If you experience any issues, check these logs:"
+echo "Apache error log: tail -f /var/log/apache2/error.log"
+echo "DaloRADIUS log: tail -f /var/log/daloradius/daloradius.log"
+echo "FreeRADIUS log: tail -f /var/log/freeradius/radius.log"
 echo "============================================"
-echo "To check if services are running:"
-echo "systemctl status apache2"
-echo "systemctl status freeradius"
-echo "============================================"
+
+# Test PHP processing
+log "Testing PHP processing..."
+cat > /var/www/html/daloradius/test.php <<EOF
+<?php
+phpinfo();
+EOF
+
+echo "To test PHP processing, visit: http://$SERVER_IP:$APACHE_PORT/daloradius/test.php"
