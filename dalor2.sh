@@ -1,10 +1,10 @@
 #!/bin/bash
 
 # Set variables
-MYSQL_ROOT_PASSWORD=""
-RADIUS_DB_PASSWORD="PASSWORD"
+MYSQL_ROOT_PASSWORD="your_secure_root_password"
+RADIUS_DB_PASSWORD="your_secure_radius_password"
 ADMIN_USER="administrator"
-ADMIN_PASS="radius"
+ADMIN_PASS="mypassw"
 
 # Function to check command execution
 check_execution() {
@@ -47,6 +47,13 @@ check_execution "FreeRADIUS installation"
 sudo mysql -u root -p${MYSQL_ROOT_PASSWORD} radius < /etc/freeradius/3.0/mods-config/sql/main/mysql/schema.sql
 check_execution "Schema import"
 
+# Clone and import daloRADIUS schemas
+git clone https://github.com/lirantal/daloradius.git
+cd daloradius
+sudo mysql -u root -p${MYSQL_ROOT_PASSWORD} radius < contrib/db/mariadb-daloradius.sql
+sudo mysql -u root -p${MYSQL_ROOT_PASSWORD} radius < contrib/db/fr3-mariadb-freeradius.sql
+cd ..
+
 # Configure SQL module
 sudo ln -sf /etc/freeradius/3.0/mods-available/sql /etc/freeradius/3.0/mods-enabled/
 sudo chgrp -h freerad /etc/freeradius/3.0/mods-available/sql
@@ -63,19 +70,10 @@ INSERT INTO radcheck (username, attribute, op, value) VALUES ('${ADMIN_USER}', '
 EOF
 check_execution "Test user creation"
 
-# Install and configure daloRADIUS
-git clone https://github.com/lirantal/daloradius.git
-cd daloradius
-
-# Import daloRADIUS and FreeRADIUS database schemas
-sudo mysql -u root -p${MYSQL_ROOT_PASSWORD} radius < contrib/db/mariadb-daloradius.sql
-sudo mysql -u root -p${MYSQL_ROOT_PASSWORD} radius < contrib/db/fr3-mariadb-freeradius.sql
-
+# Move and configure daloRADIUS
 sudo mv daloradius /var/www/
 cd /var/www/daloradius/app/common/includes/
 sudo cp daloradius.conf.php.sample daloradius.conf.php
-
-
 
 # Configure daloRADIUS database connection
 sudo sed -i "s/\$configValues\['CONFIG_DB_PASS'\] = '';/\$configValues\['CONFIG_DB_PASS'\] = '${RADIUS_DB_PASSWORD}';/" daloradius.conf.php
