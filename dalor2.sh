@@ -1,10 +1,10 @@
 #!/bin/bash
 
 # Set variables
-MYSQL_ROOT_PASSWORD="your_secure_root_password"
-RADIUS_DB_PASSWORD="your_secure_radius_password"
+MYSQL_ROOT_PASSWORD=""
+RADIUS_DB_PASSWORD="PASSWORD"
 ADMIN_USER="administrator"
-ADMIN_PASS="mypassw"
+ADMIN_PASS="radius"
 
 # Function to check command execution
 check_execution() {
